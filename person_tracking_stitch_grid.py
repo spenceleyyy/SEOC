@@ -29,6 +29,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import pandas as pd
+import time
 
 
 # Lazy import ultralytics so help/usage works even if not installed yet
@@ -141,7 +142,7 @@ def concat_videos(input_paths, out_path, resize_to=None, fps=None):
 
     return resize_to[0], resize_to[1], fps, total_frames, out_path
 
-def track_people(stitched_path, out_path, model_name="yolov8n.pt", conf=0.25, iou=0.45, grid_rows=0, grid_cols=0, save_csv=None, imgsz=640, max_det=300, agnostic_nms=False, tracker_name="deepsort"):
+def track_people(stitched_path, out_path, model_name="yolov8n.pt", conf=0.25, iou=0.45, grid_rows=0, grid_cols=0, save_csv=None, imgsz=640, max_det=300, agnostic_nms=False, tracker_name="deepsort", max_frames=0):
     """
     Run YOLO + ByteTrack on stitched video, draw boxes & ID labels & gridlines, write annotated video.
     Optionally writes a CSV with per-frame detections & IDs.
@@ -209,6 +210,7 @@ def track_people(stitched_path, out_path, model_name="yolov8n.pt", conf=0.25, io
     frames_written = 0
     print(f"[track] Input stitched video: {stitched_path}")
     print(f"[track] Intended output path: {out_path}")
+    t0 = time.time()
     if deepsort_mode:
         # Manual read + detect + DeepSORT update
         while True:
@@ -217,7 +219,12 @@ def track_people(stitched_path, out_path, model_name="yolov8n.pt", conf=0.25, io
                 break
             frame_idx += 1
             if frame_idx % 30 == 0:
-                print(f"[track] Processing frame {frame_idx}")
+                elapsed = max(time.time() - t0, 1e-6)
+                approx_fps = frames_written / elapsed if frames_written else frame_idx / elapsed
+                print(f"[track] Processing frame {frame_idx} | elapsed {elapsed:.1f}s | ~{approx_fps:.2f} fps")
+            if max_frames and frame_idx >= max_frames:
+                print(f"[track] Reached max_frames={max_frames}; stopping early for debug.")
+                break
 
             # Run detection for persons only
             det_res = model.predict(frame, conf=conf, iou=iou, imgsz=_imgsz, classes=[0], verbose=False)
@@ -277,7 +284,12 @@ def track_people(stitched_path, out_path, model_name="yolov8n.pt", conf=0.25, io
         for r in results_stream:
             frame_idx += 1
             if frame_idx % 30 == 0:
-                print(f"[track] Processing frame {frame_idx}")
+                elapsed = max(time.time() - t0, 1e-6)
+                approx_fps = frames_written / elapsed if frames_written else frame_idx / elapsed
+                print(f"[track] Processing frame {frame_idx} | elapsed {elapsed:.1f}s | ~{approx_fps:.2f} fps")
+            if max_frames and frame_idx >= max_frames:
+                print(f"[track] Reached max_frames={max_frames}; stopping early for debug.")
+                break
             frame = r.orig_img.copy()
             # Lazy writer init
             if writer is None:
@@ -367,6 +379,7 @@ def main():
     ap.add_argument("--max-det", type=int, default=300, help="Maximum detections per image.")
     ap.add_argument("--agnostic-nms", action="store_true", help="Class-agnostic NMS (can help when only 'person' class is used).")
     ap.add_argument("--tracker", default="deepsort", help="Tracker to use for IDs (deepsort, bytetrack.yaml, botsort.yaml).")
+    ap.add_argument("--max-frames", type=int, default=0, help="If >0, stop after this many frames (debug/perf sanity). 0 = no limit.")
     args = ap.parse_args()
 
     input_paths = [Path(p) for p in args.inputs]
@@ -402,7 +415,8 @@ def main():
         imgsz=args.imgsz,
         max_det=args.max_det,
         agnostic_nms=args.agnostic_nms,
-        tracker_name=args.tracker
+        tracker_name=args.tracker,
+        max_frames=args.max_frames
     )
 
     # If we wrote locally first, copy to Drive now
