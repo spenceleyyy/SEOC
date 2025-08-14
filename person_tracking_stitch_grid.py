@@ -1,4 +1,5 @@
 # One-file pipeline: stitch -> track people (stable IDs) -> grid overlay -> export
+print("[DEBUG] person_tracking_stitch_grid.py loaded successfully")
 #
 # Usage (Python):
 #     python person_tracking_stitch_grid.py \
