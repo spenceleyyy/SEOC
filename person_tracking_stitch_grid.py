@@ -137,6 +137,9 @@ def track_people(stitched_path, out_path, model_name="yolov8n.pt", conf=0.25, io
 
     csv_rows = []
     frame_idx = -1
+    frames_written = 0
+    print(f"[track] Input stitched video: {stitched_path}")
+    print(f"[track] Intended output path: {out_path}")
     for r in results_stream:
         frame_idx += 1
         # r.orig_img is the original BGR frame
@@ -192,6 +195,7 @@ def track_people(stitched_path, out_path, model_name="yolov8n.pt", conf=0.25, io
         writer.write(frame)
         frames_written += 1
 
+    print(f"[track] Total frames_written so far: {frames_written}")
     if writer is not None:
         writer.release()
 
