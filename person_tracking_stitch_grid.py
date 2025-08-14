@@ -29,6 +29,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import pandas as pd
+import subprocess
 
 
 # Lazy import ultralytics so help/usage works even if not installed yet
@@ -353,12 +354,47 @@ def main():
     ap.add_argument("--max-det", type=int, default=300, help="Maximum detections per image.")
     ap.add_argument("--agnostic-nms", action="store_true", help="Class-agnostic NMS (can help when only 'person' class is used).")
     ap.add_argument("--tracker", default="bytetrack.yaml", help="Tracker to use for IDs (e.g., bytetrack.yaml, botsort.yaml).")
+    ap.add_argument("--delegate-may25", action="store_true", help="Run the original May-25 pipeline script instead of this one (expects video_analysis_may_25.py in repo root).")
     args = ap.parse_args()
 
     input_paths = [Path(p) for p in args.inputs]
     for p in input_paths:
         if not p.exists():
             ap.error(f"Input not found: {p}")
+
+    # Optional delegation to original May-25 script
+    if args.delegate_may25:
+        may25 = Path(__file__).with_name("video_analysis_may_25.py")
+        if not may25.exists():
+            ap.error(f"--delegate-may25 requested but {may25} not found. Place your original script in the repo root.")
+
+        # Build a robust command passing through common arguments.
+        cmd = [
+            sys.executable, str(may25),
+            "--inputs", *[str(p) for p in input_paths],
+            "--out", str(Path(args.out)),
+            "--grid-rows", str(args.grid_rows),
+            "--grid-cols", str(args.grid_cols),
+            "--model", str(args.model),
+            "--conf", str(args.conf),
+            "--iou", str(args.iou),
+        ]
+        if args.save_csv:
+            cmd += ["--save-csv", str(args.save_csv)]
+        # Add advanced knobs if the original script supports them; harmless if ignored.
+        cmd += ["--imgsz", str(args.imgsz), "--max-det", str(args.max_det)]
+        if args.agnostic_nms:
+            cmd += ["--agnostic-nms"]
+        cmd += ["--tracker", str(args.tracker)]
+
+        print("[main] Delegating to video_analysis_may_25.py with:", " ".join(cmd))
+        res = subprocess.run(cmd, text=True, capture_output=True)
+        print("--- May25 STDOUT ---\n", res.stdout)
+        print("--- May25 STDERR ---\n", res.stderr)
+        if res.returncode != 0:
+            raise SystemExit(f"May-25 script failed with code {res.returncode}")
+        print("[main] Delegated script completed.")
+        return
 
     temp_stitched = Path(args.temp_stitched)
     # Stitch inputs
