@@ -1,4 +1,3 @@
-
 # One-file pipeline: stitch -> track people (stable IDs) -> grid overlay -> export
 #
 # Usage (Python):
@@ -40,7 +39,7 @@ def _import_ultralytics():
         raise
 
 def draw_grid(frame, rows: int, cols: int, thickness: int = 1):
-    \"\"\"Draw gridlines over the frame.\"\"\"
+    """Draw gridlines over the frame."""
     if rows <= 0 and cols <= 0:
         return frame
     h, w = frame.shape[:2]
@@ -57,10 +56,10 @@ def draw_grid(frame, rows: int, cols: int, thickness: int = 1):
     return frame
 
 def concat_videos(input_paths, out_path, resize_to=None, fps=None):
-    \"\"\"
+    """
     Concatenate videos by re-encoding frames. Normalizes size/fps to the first clip by default.
     Returns: (width, height, fps_used, total_frames, path_out)
-    \"\"\"
+    """
     if len(input_paths) == 1:
         # If only one input, still re-encode to ensure consistent codec and to avoid ByteTrack reset between clips
         pass
@@ -101,10 +100,10 @@ def concat_videos(input_paths, out_path, resize_to=None, fps=None):
     return resize_to[0], resize_to[1], fps, total_frames, out_path
 
 def track_people(stitched_path, out_path, model_name="yolov8n.pt", conf=0.25, iou=0.45, grid_rows=0, grid_cols=0, save_csv=None):
-    \"\"\"
+    """
     Run YOLO + ByteTrack on stitched video, draw boxes & ID labels & gridlines, write annotated video.
     Optionally writes a CSV with per-frame detections & IDs.
-    \"\"\"
+    """
     YOLO = _import_ultralytics()
     model = YOLO(model_name)
 
@@ -112,11 +111,16 @@ def track_people(stitched_path, out_path, model_name="yolov8n.pt", conf=0.25, io
     if not cap.isOpened():
         raise RuntimeError(f"Failed to open stitched video: {stitched_path}")
 
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    writer = cv2.VideoWriter(str(out_path), fourcc, fps, (w, h))
+    # We'll create the VideoWriter lazily after seeing the first frame from the tracker
+    writer = None
+    writer_size = None
+    writer_fps = 30.0  # default; we'll try to infer from source if available
+    try:
+        src_fps = cv2.VideoCapture(str(stitched_path)).get(cv2.CAP_PROP_FPS)
+        if src_fps and src_fps > 0:
+            writer_fps = src_fps
+    except Exception:
+        pass
 
     # We will stream frames through Ultralytics track() to get IDs
     # Use classes=[0] for 'person' in COCO
@@ -136,6 +140,28 @@ def track_people(stitched_path, out_path, model_name="yolov8n.pt", conf=0.25, io
         frame_idx += 1
         # r.orig_img is the original BGR frame
         frame = r.orig_img.copy()
+
+        # Lazily create writer based on the actual frame size coming from the tracker
+        if writer is None:
+            hh, ww = frame.shape[:2]
+            writer_size = (ww, hh)
+            print(f"[track] Opening VideoWriter -> path={out_path} size=({ww}x{hh}) fps={writer_fps}")
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            writer = cv2.VideoWriter(str(out_path), fourcc, writer_fps, writer_size)
+            if not writer.isOpened():
+                print("[track] mp4v failed to open. Retrying with avc1 (H.264) ...")
+                fourcc = cv2.VideoWriter_fourcc(*'avc1')
+                writer = cv2.VideoWriter(str(out_path), fourcc, writer_fps, writer_size)
+            if not writer.isOpened():
+                raise RuntimeError(
+                    f"Failed to open VideoWriter for {out_path}. Tried codecs: mp4v, avc1. "
+                    "Check that the folder exists and codec support is available."
+                )
+        else:
+            # If frame size changes (shouldn't), resize to writer size to avoid write failures
+            if (frame.shape[1], frame.shape[0]) != writer_size:
+                frame = cv2.resize(frame, writer_size, interpolation=cv2.INTER_LINEAR)
+
         # Draw grid
         if grid_rows > 0 or grid_cols > 0:
             draw_grid(frame, grid_rows, grid_cols, thickness=1)
@@ -163,9 +189,18 @@ def track_people(stitched_path, out_path, model_name="yolov8n.pt", conf=0.25, io
                     })
 
         writer.write(frame)
+        frames_written += 1
 
-    writer.release()
-    cap.release()
+    if writer is not None:
+        writer.release()
+
+    print(f"[track] Frames written: {frames_written}")
+    if frames_written == 0:
+        raise RuntimeError(
+            "No frames were written to the output video. Possible causes: "
+            "(a) the tracker produced no frames, (b) input video couldn't be read, "
+            "or (c) codec issues. Try a different model, verify input videos, or change codec."
+        )
 
     if save_csv and len(csv_rows) > 0:
         df = pd.DataFrame(csv_rows)
@@ -193,12 +228,14 @@ def main():
 
     temp_stitched = Path(args.temp_stitched)
     # Stitch inputs
+    print(f"[main] Staging stitched video at: {temp_stitched}")
     w, h, fps, total_frames, stitched_path = concat_videos(input_paths, temp_stitched)
 
     # Track on stitched video and overlay gridlines
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
+    print(f"[main] Writing annotated output to: {out_path}")
     track_people(
         stitched_path=str(stitched_path),
         out_path=str(out_path),
@@ -216,6 +253,9 @@ def main():
             temp_stitched.unlink(missing_ok=True)
     except Exception:
         pass
+
+    if not out_path.exists():
+        print(f"[main] WARNING: Expected output does not exist yet: {out_path}")
 
     print(f"Done. Wrote annotated video to: {out_path}")
     if args.save_csv:
