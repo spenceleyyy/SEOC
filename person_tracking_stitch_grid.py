@@ -249,7 +249,10 @@ def track_people(stitched_path, out_path, model_name="yolov8n.pt", conf=0.25, io
                     else:
                         boxes_np = np.vstack([boxes_np, boxes_big.astype(int)])
                         confs_np = np.concatenate([confs_np, confs_big])
-                print(f"[detect] base={{len(res0.boxes) if res0.boxes is not None else 0}}, scaled={{len(resb.boxes) if resb.boxes is not None else 0}}, merged={{len(boxes_np)}}")
+                base_cnt   = len(res0.boxes) if res0.boxes is not None else 0
+                scaled_cnt = len(resb.boxes) if resb.boxes is not None else 0
+                merged_cnt = len(boxes_np)
+                print(f"[detect] base={base_cnt}, scaled={scaled_cnt}, merged={merged_cnt}")
 
             # Build detections for DeepSORT (expects: ([x1,y1,x2,y2], conf, class))
             dets = []
