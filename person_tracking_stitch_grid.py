@@ -29,7 +29,6 @@ from pathlib import Path
 import cv2
 import numpy as np
 import pandas as pd
-import subprocess
 
 
 # Lazy import ultralytics so help/usage works even if not installed yet
@@ -142,13 +141,27 @@ def concat_videos(input_paths, out_path, resize_to=None, fps=None):
 
     return resize_to[0], resize_to[1], fps, total_frames, out_path
 
-def track_people(stitched_path, out_path, model_name="yolov8n.pt", conf=0.25, iou=0.45, grid_rows=0, grid_cols=0, save_csv=None, imgsz=640, max_det=300, agnostic_nms=False, tracker_name="bytetrack.yaml"):
+def track_people(stitched_path, out_path, model_name="yolov8n.pt", conf=0.25, iou=0.45, grid_rows=0, grid_cols=0, save_csv=None, imgsz=640, max_det=300, agnostic_nms=False, tracker_name="deepsort"):
     """
     Run YOLO + ByteTrack on stitched video, draw boxes & ID labels & gridlines, write annotated video.
     Optionally writes a CSV with per-frame detections & IDs.
     """
     YOLO = _import_ultralytics()
     model = YOLO(model_name)
+
+    # Normalize imgsz to a (w,h) tuple; some code paths call len(imgsz)
+    if isinstance(imgsz, int):
+        _imgsz = (imgsz, imgsz)
+    elif isinstance(imgsz, (list, tuple)):
+        if len(imgsz) == 1:
+            _imgsz = (int(imgsz[0]), int(imgsz[0]))
+        else:
+            _imgsz = (int(imgsz[0]), int(imgsz[1]))
+    else:
+        try:
+            _imgsz = (int(imgsz), int(imgsz))
+        except Exception:
+            _imgsz = (640, 640)
 
     # Prepare writer (lazy init) and FPS from source
     writer = None
@@ -181,7 +194,7 @@ def track_people(stitched_path, out_path, model_name="yolov8n.pt", conf=0.25, io
             stream=True,
             conf=conf,
             iou=iou,
-            imgsz=imgsz,
+            imgsz=_imgsz,
             max_det=max_det,
             agnostic_nms=agnostic_nms,
             classes=[0],
@@ -207,7 +220,7 @@ def track_people(stitched_path, out_path, model_name="yolov8n.pt", conf=0.25, io
                 print(f"[track] Processing frame {frame_idx}")
 
             # Run detection for persons only
-            det_res = model.predict(frame, conf=conf, iou=iou, imgsz=imgsz, classes=[0], verbose=False)
+            det_res = model.predict(frame, conf=conf, iou=iou, imgsz=_imgsz, classes=[0], verbose=False)
             res0 = det_res[0]
             boxes_np = res0.boxes.xyxy.cpu().numpy().astype(int) if res0.boxes is not None else np.empty((0,4), int)
             confs_np = res0.boxes.conf.cpu().numpy() if getattr(res0.boxes, 'conf', None) is not None else np.zeros((len(boxes_np),), dtype=float)
@@ -353,8 +366,7 @@ def main():
     ap.add_argument("--imgsz", type=int, default=640, help="Inference size (pixels). Try 960 or 1280 to detect smaller persons.")
     ap.add_argument("--max-det", type=int, default=300, help="Maximum detections per image.")
     ap.add_argument("--agnostic-nms", action="store_true", help="Class-agnostic NMS (can help when only 'person' class is used).")
-    ap.add_argument("--tracker", default="bytetrack.yaml", help="Tracker to use for IDs (e.g., bytetrack.yaml, botsort.yaml).")
-    ap.add_argument("--delegate-may25", action="store_true", help="Run the original May-25 pipeline script instead of this one (expects video_analysis_may_25.py in repo root).")
+    ap.add_argument("--tracker", default="deepsort", help="Tracker to use for IDs (deepsort, bytetrack.yaml, botsort.yaml).")
     args = ap.parse_args()
 
     input_paths = [Path(p) for p in args.inputs]
@@ -362,39 +374,6 @@ def main():
         if not p.exists():
             ap.error(f"Input not found: {p}")
 
-    # Optional delegation to original May-25 script
-    if args.delegate_may25:
-        may25 = Path(__file__).with_name("video_analysis_may_25.py")
-        if not may25.exists():
-            ap.error(f"--delegate-may25 requested but {may25} not found. Place your original script in the repo root.")
-
-        # Build a robust command passing through common arguments.
-        cmd = [
-            sys.executable, str(may25),
-            "--inputs", *[str(p) for p in input_paths],
-            "--out", str(Path(args.out)),
-            "--grid-rows", str(args.grid_rows),
-            "--grid-cols", str(args.grid_cols),
-            "--model", str(args.model),
-            "--conf", str(args.conf),
-            "--iou", str(args.iou),
-        ]
-        if args.save_csv:
-            cmd += ["--save-csv", str(args.save_csv)]
-        # Add advanced knobs if the original script supports them; harmless if ignored.
-        cmd += ["--imgsz", str(args.imgsz), "--max-det", str(args.max_det)]
-        if args.agnostic_nms:
-            cmd += ["--agnostic-nms"]
-        cmd += ["--tracker", str(args.tracker)]
-
-        print("[main] Delegating to video_analysis_may_25.py with:", " ".join(cmd))
-        res = subprocess.run(cmd, text=True, capture_output=True)
-        print("--- May25 STDOUT ---\n", res.stdout)
-        print("--- May25 STDERR ---\n", res.stderr)
-        if res.returncode != 0:
-            raise SystemExit(f"May-25 script failed with code {res.returncode}")
-        print("[main] Delegated script completed.")
-        return
 
     temp_stitched = Path(args.temp_stitched)
     # Stitch inputs
