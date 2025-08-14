@@ -147,15 +147,22 @@ def track_people(stitched_path, out_path, model_name="yolov8n.pt", conf=0.25, io
 
         # Lazily create writer based on the actual frame size coming from the tracker
         if writer is None:
+            import os
             hh, ww = frame.shape[:2]
             writer_size = (ww, hh)
+            print(f"[DEBUG] Attempting to write video to: {out_path}")
+            print(f"[DEBUG] VideoWriter size: ({ww}, {hh}), FPS: {writer_fps}")
             print(f"[track] Opening VideoWriter -> path={out_path} size=({ww}x{hh}) fps={writer_fps}")
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             writer = cv2.VideoWriter(str(out_path), fourcc, writer_fps, writer_size)
             if not writer.isOpened():
+                raise RuntimeError(f"❌ VideoWriter failed to open {out_path}")
+            if not writer.isOpened():
                 print("[track] mp4v failed to open. Retrying with avc1 (H.264) ...")
                 fourcc = cv2.VideoWriter_fourcc(*'avc1')
                 writer = cv2.VideoWriter(str(out_path), fourcc, writer_fps, writer_size)
+                if not writer.isOpened():
+                    raise RuntimeError(f"❌ VideoWriter failed to open {out_path}")
             if not writer.isOpened():
                 raise RuntimeError(
                     f"Failed to open VideoWriter for {out_path}. Tried codecs: mp4v, avc1. "
@@ -196,6 +203,8 @@ def track_people(stitched_path, out_path, model_name="yolov8n.pt", conf=0.25, io
         writer.write(frame)
         frames_written += 1
 
+    import os
+    print(f"[DEBUG] Finished writing video: {out_path}, exists: {os.path.exists(out_path)}")
     print(f"[track] Total frames_written so far: {frames_written}")
     if writer is not None:
         writer.release()
