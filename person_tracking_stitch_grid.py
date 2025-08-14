@@ -225,10 +225,10 @@ def track_people(stitched_path, out_path, model_name="yolov8n.pt", conf=0.25, io
             boxes_np = res0.boxes.xyxy.cpu().numpy().astype(int) if res0.boxes is not None else np.empty((0,4), int)
             confs_np = res0.boxes.conf.cpu().numpy() if getattr(res0.boxes, 'conf', None) is not None else np.zeros((len(boxes_np),), dtype=float)
 
-            # Build detections for DeepSORT: [x1,y1,x2,y2,conf,label]
+            # Build detections for DeepSORT (expects: ([x1,y1,x2,y2], conf, class))
             dets = []
             for (x1, y1, x2, y2), c in zip(boxes_np, confs_np):
-                dets.append([int(x1), int(y1), int(x2), int(y2), float(c), 'person'])
+                dets.append(([int(x1), int(y1), int(x2), int(y2)], float(c), 'person'))
 
             tracks = ds_tracker.update_tracks(dets, frame=frame)
 
