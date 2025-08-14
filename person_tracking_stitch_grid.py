@@ -192,12 +192,15 @@ def track_people(stitched_path, out_path, model_name="yolov8n.pt", conf=0.25, io
                         "conf": float(c)
                     })
 
+        print(f"[DEBUG] Writing frame {frame_idx} to {out_path}")
         writer.write(frame)
         frames_written += 1
 
     print(f"[track] Total frames_written so far: {frames_written}")
     if writer is not None:
         writer.release()
+        print(f"[DEBUG] Video writer released. Output should be at: {out_path}")
+        print(f"[DEBUG] Checking if file exists: {Path(out_path).exists()}")
 
     print(f"[track] Frames written: {frames_written}")
     if frames_written == 0:
