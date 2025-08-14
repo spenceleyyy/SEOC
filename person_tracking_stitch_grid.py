@@ -30,6 +30,7 @@ import cv2
 import numpy as np
 import pandas as pd
 import time
+from typing import Tuple
 
 
 # Lazy import ultralytics so help/usage works even if not installed yet
@@ -142,7 +143,7 @@ def concat_videos(input_paths, out_path, resize_to=None, fps=None):
 
     return resize_to[0], resize_to[1], fps, total_frames, out_path
 
-def track_people(stitched_path, out_path, model_name="yolov8n.pt", conf=0.25, iou=0.45, grid_rows=0, grid_cols=0, save_csv=None, imgsz=640, max_det=300, agnostic_nms=False, tracker_name="deepsort", max_frames=0):
+def track_people(stitched_path, out_path, model_name="yolov8n.pt", conf=0.25, iou=0.45, grid_rows=0, grid_cols=0, save_csv=None, imgsz=640, max_det=300, agnostic_nms=False, tracker_name="deepsort", max_frames=0, tta=False, detect_scale: float = 1.0):
     """
     Run YOLO + ByteTrack on stitched video, draw boxes & ID labels & gridlines, write annotated video.
     Optionally writes a CSV with per-frame detections & IDs.
@@ -226,16 +227,50 @@ def track_people(stitched_path, out_path, model_name="yolov8n.pt", conf=0.25, io
                 print(f"[track] Reached max_frames={max_frames}; stopping early for debug.")
                 break
 
-            # Run detection for persons only
-            det_res = model.predict(frame, conf=conf, iou=iou, imgsz=_imgsz, classes=[0], verbose=False)
+            # Run detection for persons only (optionally with TTA)
+            det_res = model.predict(frame, conf=conf, iou=iou, imgsz=_imgsz, classes=[0], verbose=False, augment=tta)
             res0 = det_res[0]
             boxes_np = res0.boxes.xyxy.cpu().numpy().astype(int) if res0.boxes is not None else np.empty((0,4), int)
             confs_np = res0.boxes.conf.cpu().numpy() if getattr(res0.boxes, 'conf', None) is not None else np.zeros((len(boxes_np),), dtype=float)
+
+            # Optional higher-scale second pass to catch small/far persons
+            if detect_scale and detect_scale > 1.0:
+                h0, w0 = frame.shape[:2]
+                frame_big = cv2.resize(frame, (int(w0*detect_scale), int(h0*detect_scale)), interpolation=cv2.INTER_LINEAR)
+                big_imgsz: Tuple[int,int] = (int(_imgsz[0]*detect_scale), int(_imgsz[1]*detect_scale))
+                det_res_big = model.predict(frame_big, conf=conf, iou=iou, imgsz=big_imgsz, classes=[0], verbose=False, augment=tta)
+                resb = det_res_big[0]
+                if resb.boxes is not None and len(resb.boxes) > 0:
+                    boxes_big = resb.boxes.xyxy.cpu().numpy() / detect_scale
+                    confs_big = resb.boxes.conf.cpu().numpy()
+                    if boxes_np.size == 0:
+                        boxes_np = boxes_big.astype(int)
+                        confs_np = confs_big
+                    else:
+                        boxes_np = np.vstack([boxes_np, boxes_big.astype(int)])
+                        confs_np = np.concatenate([confs_np, confs_big])
+                print(f"[detect] base={{len(res0.boxes) if res0.boxes is not None else 0}}, scaled={{len(resb.boxes) if resb.boxes is not None else 0}}, merged={{len(boxes_np)}}")
 
             # Build detections for DeepSORT (expects: ([x1,y1,x2,y2], conf, class))
             dets = []
             for (x1, y1, x2, y2), c in zip(boxes_np, confs_np):
                 dets.append(([int(x1), int(y1), int(x2), int(y2)], float(c), 'person'))
+
+            if not dets:
+                # Still draw grid and write the frame to keep output cadence
+                if grid_rows > 0 or grid_cols > 0:
+                    draw_grid(frame, grid_rows, grid_cols, thickness=1)
+                if writer is None:
+                    hh, ww = frame.shape[:2]
+                    writer_size = (ww, hh)
+                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                    writer = cv2.VideoWriter(str(out_path), fourcc, writer_fps, writer_size)
+                    if not writer.isOpened():
+                        fourcc = cv2.VideoWriter_fourcc(*'avc1')
+                        writer = cv2.VideoWriter(str(out_path), fourcc, writer_fps, writer_size)
+                writer.write(frame)
+                frames_written += 1
+                continue
 
             tracks = ds_tracker.update_tracks(dets, frame=frame)
 
@@ -380,6 +415,8 @@ def main():
     ap.add_argument("--agnostic-nms", action="store_true", help="Class-agnostic NMS (can help when only 'person' class is used).")
     ap.add_argument("--tracker", default="deepsort", help="Tracker to use for IDs (deepsort, bytetrack.yaml, botsort.yaml).")
     ap.add_argument("--max-frames", type=int, default=0, help="If >0, stop after this many frames (debug/perf sanity). 0 = no limit.")
+    ap.add_argument("--tta", action="store_true", help="Enable YOLO test-time augmentation for detection (slower, higher recall).")
+    ap.add_argument("--detect-scale", type=float, default=1.0, help="Optional second-pass detection scale (>1.0 upscales the frame). E.g., 1.5")
     args = ap.parse_args()
 
     input_paths = [Path(p) for p in args.inputs]
@@ -416,7 +453,9 @@ def main():
         max_det=args.max_det,
         agnostic_nms=args.agnostic_nms,
         tracker_name=args.tracker,
-        max_frames=args.max_frames
+        max_frames=args.max_frames,
+        tta=args.tta,
+        detect_scale=args.detect_scale
     )
 
     # If we wrote locally first, copy to Drive now
