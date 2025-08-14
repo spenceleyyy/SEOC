@@ -31,6 +31,7 @@ import numpy as np
 import pandas as pd
 import time
 from typing import Tuple
+from collections import defaultdict
 
 
 # Lazy import ultralytics so help/usage works even if not installed yet
@@ -143,7 +144,7 @@ def concat_videos(input_paths, out_path, resize_to=None, fps=None):
 
     return resize_to[0], resize_to[1], fps, total_frames, out_path
 
-def track_people(stitched_path, out_path, model_name="yolov8n.pt", conf=0.25, iou=0.45, grid_rows=0, grid_cols=0, save_csv=None, imgsz=640, max_det=300, agnostic_nms=False, tracker_name="deepsort", max_frames=0, tta=False, detect_scale: float = 1.0):
+def track_people(stitched_path, out_path, model_name="yolov8n.pt", conf=0.25, iou=0.45, grid_rows=0, grid_cols=0, save_csv=None, save_traj=None, traj_every: int = 1, imgsz=640, max_det=300, agnostic_nms=False, tracker_name="deepsort", max_frames=0, tta=False, detect_scale: float = 1.0):
     """
     Run YOLO + ByteTrack on stitched video, draw boxes & ID labels & gridlines, write annotated video.
     Optionally writes a CSV with per-frame detections & IDs.
@@ -175,6 +176,17 @@ def track_people(stitched_path, out_path, model_name="yolov8n.pt", conf=0.25, io
             writer_fps = src_fps_probe
     except Exception:
         pass
+
+    # Trajectory storage: id -> list of (x,y)
+    traj_points = defaultdict(list)
+
+    def _color_for_id(i: int):
+        # deterministic pseudo-random but stable color per ID
+        i = int(i)
+        r = (37 * i) % 255
+        g = (17 * i + 99) % 255
+        b = (73 * i + 179) % 255
+        return int(b), int(g), int(r)
 
     # If user requested DeepSORT, run manual detection + DeepSORT tracking
     use_deepsort = str(tracker_name).lower() in {"deepsort", "deep_sort"}
@@ -301,10 +313,14 @@ def track_people(stitched_path, out_path, model_name="yolov8n.pt", conf=0.25, io
                     continue
                 x1, y1, x2, y2 = map(int, trk.to_tlbr())
                 track_id = int(trk.track_id)
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                if (traj_every <= 1) or (frame_idx % max(traj_every,1) == 0):
+                    cx = int((x1 + x2) / 2)
+                    cy = int((y1 + y2) / 2)
+                    traj_points[track_id].append((cx, cy))
+                cv2.rectangle(frame, (x1, y1), (x2, y2), _color_for_id(track_id), 2)
                 label = f"ID {track_id}"
                 (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-                cv2.rectangle(frame, (x1, y1 - th - 6), (x1 + tw + 4, y1), (0, 255, 0), -1)
+                cv2.rectangle(frame, (x1, y1 - th - 6), (x1 + tw + 4, y1), _color_for_id(track_id), -1)
                 cv2.putText(frame, label, (x1 + 2, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 1, cv2.LINE_AA)
 
                 if save_csv:
@@ -358,11 +374,16 @@ def track_people(stitched_path, out_path, model_name="yolov8n.pt", conf=0.25, io
                 ids = r.boxes.id.cpu().numpy().astype(int) if r.boxes.id is not None else np.array([-1]*len(boxes))
                 confs = r.boxes.conf.cpu().numpy() if r.boxes.conf is not None else np.zeros(len(boxes))
                 for (x1, y1, x2, y2), track_id, c in zip(boxes, ids, confs):
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    color = _color_for_id(track_id) if track_id >= 0 else (0, 255, 0)
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
                     label = f"ID {track_id if track_id>=0 else '?'}  {c:.2f}"
                     (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-                    cv2.rectangle(frame, (x1, y1 - th - 6), (x1 + tw + 4, y1), (0, 255, 0), -1)
+                    cv2.rectangle(frame, (x1, y1 - th - 6), (x1 + tw + 4, y1), color, -1)
                     cv2.putText(frame, label, (x1 + 2, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 1, cv2.LINE_AA)
+                    if track_id >= 0 and ((traj_every <= 1) or (frame_idx % max(traj_every,1) == 0)):
+                        cx = int((x1 + x2) / 2)
+                        cy = int((y1 + y2) / 2)
+                        traj_points[int(track_id)].append((cx, cy))
                     if save_csv:
                         csv_rows.append({
                             "frame": frame_idx,
@@ -400,6 +421,21 @@ def track_people(stitched_path, out_path, model_name="yolov8n.pt", conf=0.25, io
         df = pd.DataFrame(csv_rows)
         df.to_csv(save_csv, index=False)
 
+    # Render trajectories image if requested
+    if save_traj and writer_size is not None and len(traj_points) > 0:
+        traj_w, traj_h = writer_size
+        canvas = np.full((traj_h, traj_w, 3), 255, dtype=np.uint8)
+        for tid, pts in traj_points.items():
+            if len(pts) >= 2:
+                color = _color_for_id(tid)
+                cv2.polylines(canvas, [np.array(pts, dtype=np.int32)], isClosed=False, color=color, thickness=2, lineType=cv2.LINE_AA)
+                # mark start/end
+                cv2.circle(canvas, pts[0], 3, color, -1)
+                cv2.circle(canvas, pts[-1], 3, color, -1)
+                cv2.putText(canvas, f"ID {tid}", pts[-1], cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+        cv2.imwrite(str(save_traj), canvas)
+        print(f"[traj] Saved trajectory image: {save_traj} ({traj_w}x{traj_h})")
+
     return out_path
 
 def main():
@@ -420,6 +456,8 @@ def main():
     ap.add_argument("--max-frames", type=int, default=0, help="If >0, stop after this many frames (debug/perf sanity). 0 = no limit.")
     ap.add_argument("--tta", action="store_true", help="Enable YOLO test-time augmentation for detection (slower, higher recall).")
     ap.add_argument("--detect-scale", type=float, default=1.0, help="Optional second-pass detection scale (>1.0 upscales the frame). E.g., 1.5")
+    ap.add_argument("--save-traj", default=None, help="If set, save per-ID trajectory plot PNG to this path.")
+    ap.add_argument("--traj-every", type=int, default=1, help="Downsample trajectories: record a point every N frames (default 1).")
     args = ap.parse_args()
 
     input_paths = [Path(p) for p in args.inputs]
@@ -458,7 +496,9 @@ def main():
         tracker_name=args.tracker,
         max_frames=args.max_frames,
         tta=args.tta,
-        detect_scale=args.detect_scale
+        detect_scale=args.detect_scale,
+        save_traj=args.save_traj,
+        traj_every=args.traj_every
     )
 
     # If we wrote locally first, copy to Drive now
