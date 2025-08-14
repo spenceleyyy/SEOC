@@ -84,9 +84,17 @@ def concat_videos(input_paths, out_path, resize_to=None, fps=None):
 
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     writer = cv2.VideoWriter(str(out_path), fourcc, fps, resize_to)
+    if not writer.isOpened():
+        print(f"[concat] mp4v failed to open {out_path}. Retrying with avc1 (H.264)...")
+        fourcc = cv2.VideoWriter_fourcc(*'avc1')
+        writer = cv2.VideoWriter(str(out_path), fourcc, fps, resize_to)
+    if not writer.isOpened():
+        raise RuntimeError(
+            f"[concat] Failed to open VideoWriter for {out_path}. Tried codecs: mp4v, avc1."
+        )
 
     total_frames = 0
-    for cap in caps:
+    for p, cap in zip(input_paths, caps):
         while True:
             ok, frame = cap.read()
             if not ok:
@@ -95,9 +103,20 @@ def concat_videos(input_paths, out_path, resize_to=None, fps=None):
                 frame = cv2.resize(frame, resize_to, interpolation=cv2.INTER_LINEAR)
             writer.write(frame)
             total_frames += 1
+        print(f"[concat] Finished segment: {p}, frames so far: {total_frames}")
         cap.release()
 
     writer.release()
+
+    if total_frames == 0:
+        raise RuntimeError("[concat] No frames were concatenated. Verify input videos are readable.")
+    try:
+        import os
+        size_mb = os.path.getsize(str(out_path)) / 1_000_000
+        print(f"[concat] Wrote stitched video: {out_path} ({size_mb:.2f} MB)")
+    except Exception:
+        pass
+
     return resize_to[0], resize_to[1], fps, total_frames, out_path
 
 def track_people(stitched_path, out_path, model_name="yolov8n.pt", conf=0.25, iou=0.45, grid_rows=0, grid_cols=0, save_csv=None):
@@ -252,10 +271,15 @@ def main():
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    print(f"[main] Writing annotated output to: {out_path}")
+    # Drive-safe: if writing to Google Drive, write locally first and then copy
+    write_local_first = str(out_path).startswith("/content/drive/")
+    local_tmp = Path("/tmp/_out_tmp.mp4")
+    effective_out = local_tmp if write_local_first else out_path
+
+    print(f"[main] Writing annotated output to: {effective_out}")
     track_people(
         stitched_path=str(stitched_path),
-        out_path=str(out_path),
+        out_path=str(effective_out),
         model_name=args.model,
         conf=args.conf,
         iou=args.iou,
@@ -263,6 +287,19 @@ def main():
         grid_cols=args.grid_cols,
         save_csv=args.save_csv
     )
+
+    # If we wrote locally first, copy to Drive now
+    if write_local_first:
+        try:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        if effective_out.exists():
+            import shutil
+            shutil.copyfile(str(effective_out), str(out_path))
+            print(f"[main] Copied local output to Drive: {out_path}")
+        else:
+            print(f"[main] WARNING: Local temp output missing: {effective_out}")
 
     # Cleanup temp if out != temp
     try:
