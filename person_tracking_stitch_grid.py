@@ -30,6 +30,7 @@ import cv2
 import numpy as np
 import pandas as pd
 
+
 # Lazy import ultralytics so help/usage works even if not installed yet
 def _import_ultralytics():
     try:
@@ -38,6 +39,17 @@ def _import_ultralytics():
     except Exception as e:
         print("ERROR: ultralytics not installed. Install with `pip install ultralytics`.", file=sys.stderr)
         raise
+
+# Lazy import deep_sort_realtime only if user selects DeepSORT
+def _import_deepsort():
+    try:
+        from deep_sort_realtime.deepsort_tracker import DeepSort
+        return DeepSort
+    except Exception as e:
+        raise ImportError(
+            "DeepSORT not available. Install with: pip install deep-sort-realtime\n"
+            "Then run with --tracker deepsort"
+        )
 
 def draw_grid(frame, rows: int, cols: int, thickness: int = 1):
     """Draw gridlines over the frame."""
@@ -129,7 +141,7 @@ def concat_videos(input_paths, out_path, resize_to=None, fps=None):
 
     return resize_to[0], resize_to[1], fps, total_frames, out_path
 
-def track_people(stitched_path, out_path, model_name="yolov8n.pt", conf=0.25, iou=0.45, grid_rows=0, grid_cols=0, save_csv=None):
+def track_people(stitched_path, out_path, model_name="yolov8n.pt", conf=0.25, iou=0.45, grid_rows=0, grid_cols=0, save_csv=None, imgsz=640, max_det=300, agnostic_nms=False, tracker_name="bytetrack.yaml"):
     """
     Run YOLO + ByteTrack on stitched video, draw boxes & ID labels & gridlines, write annotated video.
     Optionally writes a CSV with per-frame detections & IDs.
@@ -137,104 +149,167 @@ def track_people(stitched_path, out_path, model_name="yolov8n.pt", conf=0.25, io
     YOLO = _import_ultralytics()
     model = YOLO(model_name)
 
-    cap = cv2.VideoCapture(str(stitched_path))
-    if not cap.isOpened():
-        raise RuntimeError(f"Failed to open stitched video: {stitched_path}")
-
-    # We'll create the VideoWriter lazily after seeing the first frame from the tracker
+    # Prepare writer (lazy init) and FPS from source
     writer = None
     writer_size = None
-    writer_fps = 30.0  # default; we'll try to infer from source if available
+    writer_fps = 30.0
     try:
-        src_fps = cv2.VideoCapture(str(stitched_path)).get(cv2.CAP_PROP_FPS)
-        if src_fps and src_fps > 0:
-            writer_fps = src_fps
+        src_fps_probe = cv2.VideoCapture(str(stitched_path)).get(cv2.CAP_PROP_FPS)
+        if src_fps_probe and src_fps_probe > 0:
+            writer_fps = src_fps_probe
     except Exception:
         pass
 
-    print("[track] Initializing YOLO tracking stream ...")
-    # We will stream frames through Ultralytics track() to get IDs
-    # Use classes=[0] for 'person' in COCO
-    results_stream = model.track(
-        source=str(stitched_path),
-        stream=True,
-        conf=conf,
-        iou=iou,
-        classes=[0],
-        persist=True,            # keep tracks across frames
-        tracker="bytetrack.yaml" # default tracker for IDs
-    )
-    print("[track] YOLO stream created. Beginning frame iteration ...")
+    # If user requested DeepSORT, run manual detection + DeepSORT tracking
+    use_deepsort = str(tracker_name).lower() in {"deepsort", "deep_sort"}
+    if use_deepsort:
+        print("[track] Using DeepSORT for ID tracking.")
+        DeepSort = _import_deepsort()
+        # Reasonable defaults; tweak as needed
+        ds_tracker = DeepSort(max_age=30, n_init=3, max_iou_distance=0.7, nms_max_overlap=1.0,
+                              embedder='mobilenet', half=True, bgr=True)
+        cap = cv2.VideoCapture(str(stitched_path))
+        if not cap.isOpened():
+            raise RuntimeError(f"Failed to open stitched video: {stitched_path}")
+        frame_iter = iter(int, 1)  # dummy placeholder, we'll use while loop below
+        deepsort_mode = True
+    else:
+        print("[track] Initializing Ultralytics tracking stream ...")
+        results_stream = model.track(
+            source=str(stitched_path),
+            stream=True,
+            conf=conf,
+            iou=iou,
+            imgsz=imgsz,
+            max_det=max_det,
+            agnostic_nms=agnostic_nms,
+            classes=[0],
+            persist=True,
+            tracker=tracker_name
+        )
+        print("[track] YOLO stream created. Beginning frame iteration ...")
+        deepsort_mode = False
 
     csv_rows = []
     frame_idx = -1
     frames_written = 0
     print(f"[track] Input stitched video: {stitched_path}")
     print(f"[track] Intended output path: {out_path}")
-    for r in results_stream:
-        frame_idx += 1
-        if frame_idx % 30 == 0:
-            print(f"[track] Processing frame {frame_idx}")
-        # r.orig_img is the original BGR frame
-        frame = r.orig_img.copy()
+    if deepsort_mode:
+        # Manual read + detect + DeepSORT update
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            frame_idx += 1
+            if frame_idx % 30 == 0:
+                print(f"[track] Processing frame {frame_idx}")
 
-        # Lazily create writer based on the actual frame size coming from the tracker
-        if writer is None:
-            import os
-            hh, ww = frame.shape[:2]
-            writer_size = (ww, hh)
-            print(f"[DEBUG] Attempting to write video to: {out_path}")
-            print(f"[DEBUG] VideoWriter size: ({ww}, {hh}), FPS: {writer_fps}")
-            print(f"[track] Opening VideoWriter -> path={out_path} size=({ww}x{hh}) fps={writer_fps}")
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            writer = cv2.VideoWriter(str(out_path), fourcc, writer_fps, writer_size)
-            if not writer.isOpened():
-                raise RuntimeError(f"❌ VideoWriter failed to open {out_path}")
-            if not writer.isOpened():
-                print("[track] mp4v failed to open. Retrying with avc1 (H.264) ...")
-                fourcc = cv2.VideoWriter_fourcc(*'avc1')
+            # Run detection for persons only
+            det_res = model.predict(frame, conf=conf, iou=iou, imgsz=imgsz, classes=[0], verbose=False)
+            res0 = det_res[0]
+            boxes_np = res0.boxes.xyxy.cpu().numpy().astype(int) if res0.boxes is not None else np.empty((0,4), int)
+            confs_np = res0.boxes.conf.cpu().numpy() if getattr(res0.boxes, 'conf', None) is not None else np.zeros((len(boxes_np),), dtype=float)
+
+            # Build detections for DeepSORT: [x1,y1,x2,y2,conf,label]
+            dets = []
+            for (x1, y1, x2, y2), c in zip(boxes_np, confs_np):
+                dets.append([int(x1), int(y1), int(x2), int(y2), float(c), 'person'])
+
+            tracks = ds_tracker.update_tracks(dets, frame=frame)
+
+            # Lazy writer init
+            if writer is None:
+                hh, ww = frame.shape[:2]
+                writer_size = (ww, hh)
+                print(f"[track] Opening VideoWriter -> path={out_path} size=({ww}x{hh}) fps={writer_fps}")
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
                 writer = cv2.VideoWriter(str(out_path), fourcc, writer_fps, writer_size)
                 if not writer.isOpened():
-                    raise RuntimeError(f"❌ VideoWriter failed to open {out_path}")
-            if not writer.isOpened():
-                raise RuntimeError(
-                    f"Failed to open VideoWriter for {out_path}. Tried codecs: mp4v, avc1. "
-                    "Check that the folder exists and codec support is available."
-                )
-        else:
-            # If frame size changes (shouldn't), resize to writer size to avoid write failures
-            if (frame.shape[1], frame.shape[0]) != writer_size:
-                frame = cv2.resize(frame, writer_size, interpolation=cv2.INTER_LINEAR)
+                    print("[track] mp4v failed to open. Retrying with avc1 (H.264) ...")
+                    fourcc = cv2.VideoWriter_fourcc(*'avc1')
+                    writer = cv2.VideoWriter(str(out_path), fourcc, writer_fps, writer_size)
+                if not writer.isOpened():
+                    raise RuntimeError(f"Failed to open VideoWriter for {out_path}")
 
-        # Draw grid
-        if grid_rows > 0 or grid_cols > 0:
-            draw_grid(frame, grid_rows, grid_cols, thickness=1)
+            # Draw grid
+            if grid_rows > 0 or grid_cols > 0:
+                draw_grid(frame, grid_rows, grid_cols, thickness=1)
 
-        if r.boxes is not None and len(r.boxes) > 0:
-            boxes = r.boxes.xyxy.cpu().numpy().astype(int)  # [N, 4]
-            ids = r.boxes.id.cpu().numpy().astype(int) if r.boxes.id is not None else np.array([-1]*len(boxes))
-            confs = r.boxes.conf.cpu().numpy() if r.boxes.conf is not None else np.zeros(len(boxes))
-
-            for (x1, y1, x2, y2), track_id, c in zip(boxes, ids, confs):
-                # Draw rectangle & label
+            # Draw DeepSORT tracks and collect CSV
+            for trk in tracks:
+                if not trk.is_confirmed() or trk.time_since_update > 0:
+                    continue
+                x1, y1, x2, y2 = map(int, trk.to_tlbr())
+                track_id = int(trk.track_id)
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                label = f"ID {track_id if track_id>=0 else '?'}  {c:.2f}"
+                label = f"ID {track_id}"
                 (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
                 cv2.rectangle(frame, (x1, y1 - th - 6), (x1 + tw + 4, y1), (0, 255, 0), -1)
                 cv2.putText(frame, label, (x1 + 2, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 1, cv2.LINE_AA)
 
-                # Collect CSV row
                 if save_csv:
                     csv_rows.append({
                         "frame": frame_idx,
-                        "id": int(track_id),
-                        "x1": int(x1), "y1": int(y1), "x2": int(x2), "y2": int(y2),
-                        "conf": float(c)
+                        "id": track_id,
+                        "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                        "conf": float(1.0)  # DeepSORT tracks don't carry a single conf; keep placeholder
                     })
 
-        print(f"[DEBUG] Writing frame {frame_idx} to {out_path}")
-        writer.write(frame)
-        frames_written += 1
+            writer.write(frame)
+            frames_written += 1
+    else:
+        # Ultralytics trackers branch (existing behavior)
+        for r in results_stream:
+            frame_idx += 1
+            if frame_idx % 30 == 0:
+                print(f"[track] Processing frame {frame_idx}")
+            frame = r.orig_img.copy()
+            # Lazy writer init
+            if writer is None:
+                import os
+                hh, ww = frame.shape[:2]
+                writer_size = (ww, hh)
+                print(f"[DEBUG] Attempting to write video to: {out_path}")
+                print(f"[DEBUG] VideoWriter size: ({ww}, {hh}), FPS: {writer_fps}")
+                print(f"[track] Opening VideoWriter -> path={out_path} size=({ww}x{hh}) fps={writer_fps}")
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                writer = cv2.VideoWriter(str(out_path), fourcc, writer_fps, writer_size)
+                if not writer.isOpened():
+                    print("[track] mp4v failed to open. Retrying with avc1 (H.264) ...")
+                    fourcc = cv2.VideoWriter_fourcc(*'avc1')
+                    writer = cv2.VideoWriter(str(out_path), fourcc, writer_fps, writer_size)
+                if not writer.isOpened():
+                    raise RuntimeError(f"Failed to open VideoWriter for {out_path}")
+            else:
+                if (frame.shape[1], frame.shape[0]) != writer_size:
+                    frame = cv2.resize(frame, writer_size, interpolation=cv2.INTER_LINEAR)
+
+            # Draw grid
+            if grid_rows > 0 or grid_cols > 0:
+                draw_grid(frame, grid_rows, grid_cols, thickness=1)
+
+            if r.boxes is not None and len(r.boxes) > 0:
+                boxes = r.boxes.xyxy.cpu().numpy().astype(int)
+                ids = r.boxes.id.cpu().numpy().astype(int) if r.boxes.id is not None else np.array([-1]*len(boxes))
+                confs = r.boxes.conf.cpu().numpy() if r.boxes.conf is not None else np.zeros(len(boxes))
+                for (x1, y1, x2, y2), track_id, c in zip(boxes, ids, confs):
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    label = f"ID {track_id if track_id>=0 else '?'}  {c:.2f}"
+                    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                    cv2.rectangle(frame, (x1, y1 - th - 6), (x1 + tw + 4, y1), (0, 255, 0), -1)
+                    cv2.putText(frame, label, (x1 + 2, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 1, cv2.LINE_AA)
+                    if save_csv:
+                        csv_rows.append({
+                            "frame": frame_idx,
+                            "id": int(track_id),
+                            "x1": int(x1), "y1": int(y1), "x2": int(x2), "y2": int(y2),
+                            "conf": float(c)
+                        })
+
+            print(f"[DEBUG] Writing frame {frame_idx} to {out_path}")
+            writer.write(frame)
+            frames_written += 1
 
     import os
     print(f"[DEBUG] Finished writing video: {out_path}, exists: {os.path.exists(out_path)}")
@@ -243,6 +318,11 @@ def track_people(stitched_path, out_path, model_name="yolov8n.pt", conf=0.25, io
         writer.release()
         print(f"[DEBUG] Video writer released. Output should be at: {out_path}")
         print(f"[DEBUG] Checking if file exists: {Path(out_path).exists()}")
+    try:
+        if use_deepsort:
+            cap.release()
+    except Exception:
+        pass
 
     print(f"[track] Frames written: {frames_written}")
     if frames_written == 0:
@@ -269,6 +349,10 @@ def main():
     ap.add_argument("--conf", type=float, default=0.25, help="Detection confidence threshold.")
     ap.add_argument("--iou", type=float, default=0.45, help="NMS IoU threshold.")
     ap.add_argument("--save-csv", default=None, help="Optional path to save per-frame tracks as CSV.")
+    ap.add_argument("--imgsz", type=int, default=640, help="Inference size (pixels). Try 960 or 1280 to detect smaller persons.")
+    ap.add_argument("--max-det", type=int, default=300, help="Maximum detections per image.")
+    ap.add_argument("--agnostic-nms", action="store_true", help="Class-agnostic NMS (can help when only 'person' class is used).")
+    ap.add_argument("--tracker", default="bytetrack.yaml", help="Tracker to use for IDs (e.g., bytetrack.yaml, botsort.yaml).")
     args = ap.parse_args()
 
     input_paths = [Path(p) for p in args.inputs]
@@ -299,7 +383,11 @@ def main():
         iou=args.iou,
         grid_rows=args.grid_rows,
         grid_cols=args.grid_cols,
-        save_csv=args.save_csv
+        save_csv=args.save_csv,
+        imgsz=args.imgsz,
+        max_det=args.max_det,
+        agnostic_nms=args.agnostic_nms,
+        tracker_name=args.tracker
     )
 
     # If we wrote locally first, copy to Drive now
